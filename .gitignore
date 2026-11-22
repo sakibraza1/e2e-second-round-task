@@ -6,3 +6,4 @@ venv/
 # Local data created when you run the project
 db.sqlite3
 blobstore/
+demo-work/

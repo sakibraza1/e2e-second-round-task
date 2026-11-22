@@ -79,10 +79,14 @@ WSGI_APPLICATION = 'e2e_second.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# The database and the blob store live here. demo.sh points this somewhere else so it
+# never touches your data.
+DATA_DIR = Path(os.environ.get('IMAGESTORE_DATA_DIR', BASE_DIR))
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': DATA_DIR / 'db.sqlite3',
     }
 }
 
@@ -129,7 +133,7 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Where the image store keeps file contents ("blobs"), one file per unique checksum.
-BLOB_STORAGE_DIR = BASE_DIR / 'blobstore'
+BLOB_STORAGE_DIR = DATA_DIR / 'blobstore'
 
 # Limits for one uploaded image, counted after decompression, so a small
 # .tar.gz can't unpack into something that fills the disk.

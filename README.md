@@ -1,12 +1,64 @@
-# Lazy, deduplicated container images with Django REST Framework
+# A lazy file system that starts containers faster
 
-This project is a small solution to the problem described in this video:
+My solution to the problem in this video:
 
 **[Building a File System for Speed: Modal's Approach to Faster Containers](https://www.youtube.com/watch?v=ttRwXIR-xTc)** (devtools.fm, about 4 minutes)
 
-It's a Django REST API that stores container images the way the video describes: every file is stored once,
-under its checksum, a push only uploads files the server doesn't have yet, and a machine downloads a file only
-when that file is actually read.
+There are two parts:
+
+- **A registry API in Django REST Framework.** It stores every file of every image once, under its checksum,
+  and keeps a small index per image.
+- **A lazy file system (FUSE).** It mounts an image from that API so a container sees all of it right away,
+  but it only downloads a file the first time something opens it.
+
+`demo.sh` starts real `python:3.12-slim` and `python:3.11-slim` containers both ways and times them.
+
+## Demo video
+
+[`demo.cast`](demo.cast) is an asciinema screencast of `./demo.sh`: 33 seconds, recorded at real speed. To play
+it in a terminal:
+
+```bash
+asciinema play demo.cast
+```
+
+GitHub can't play `.cast` files in the page. `asciinema upload demo.cast` gives a link that plays in any
+browser. Install the player first with `pip install asciinema` if you don't have it.
+
+## Results
+
+From the recorded run, on my laptop. Both ways start the same container: Python inside `python:3.12-slim`, in
+its own namespaces, without root.
+
+| Seconds until the container printed "hello" | Usual way | Lazy way |
+|---|---:|---:|
+| Localhost, first start | 0.75 | 0.76 |
+| Localhost, second start on the same machine | 0.14 | 0.32 |
+| Simulated 1 Gbit/s link with 2 ms latency, first start | 1.28 | 1.59 |
+| Simulated 100 Mbit/s link with 10 ms latency, first start | 10.14 | **3.99** |
+| Then `python:3.11-slim` on the same machine (100 Mbit/s) | – | **2.35** |
+
+- The **usual way** downloads the whole image (123.9 MB), unpacks it, then starts the container.
+- The **lazy way** mounts the image and starts the container right away. It downloaded only 84 files,
+  22.5 MB, which is 19% of the image.
+- **`python:3.11-slim`** needed just 7.2 MB more, because 33 of its file opens found the content already in the
+  cache from 3.12.
+
+What the numbers say:
+
+- **When the network is the slow part, the lazy way wins clearly:** 10.1 s becomes 4.0 s at 100 Mbit/s. That's
+  the case the video is about: machines pulling images from a registry, not from localhost.
+- **It always moves far less data:** 5.5 times less for the first image, and only what's new for the next one.
+- **On localhost or a fast 1 Gbit/s link it's about even.** Downloading is almost free there, and the lazy way
+  pays one network round trip per file while Python opens about 85 files one after another. A FUSE file system
+  written in Python also adds overhead to every file access. That's also why a second start from an
+  already-unpacked folder is quicker (0.14 s vs 0.32 s).
+- **The known fix is prefetching.** Record once which files an image reads at start-up, then download them in
+  parallel as soon as the image is mounted. eStargz and Nydus do this. It's the next step (see
+  [section 11](#11-whats-simplified-and-what-a-real-system-would-add)).
+
+Expect some variation between runs. The slow links are simulated in the client (see `Link` in
+`imagestore/client.py`). Both ways go through the same code, so the comparison is fair.
 
 **Contents**
 
@@ -18,7 +70,7 @@ when that file is actually read.
 6. [Code tour](#6-code-tour)
 7. [API reference](#7-api-reference)
 8. [Run it](#8-run-it)
-9. [The demo and what its numbers mean](#9-the-demo-and-what-its-numbers-mean)
+9. [The demos and what their numbers mean](#9-the-demos-and-what-their-numbers-mean)
 10. [How to explain this project](#10-how-to-explain-this-project)
 11. [What's simplified, and what a real system would add](#11-whats-simplified-and-what-a-real-system-would-add)
 12. [Glossary](#12-glossary)
@@ -68,7 +120,7 @@ static libraries, tools such as compilers, and so on. A typical app touches only
 
 Researchers measured this in the paper *Slacker: Fast Distribution with Lazy Docker Containers*
 (Harter et al., USENIX FAST 2016): **pulling took 76% of container start time, but only 6.4% of the pulled
-data was ever read.** The machine waits for gigabytes it doesn't need.
+data was ever read.** In this project's demo, starting Python reads 19% of `python:3.12-slim`.
 
 ### Problem 2: the same data is stored and moved again and again
 
@@ -81,8 +133,8 @@ exactly the same**:
 - **The same file in different layers isn't shared.** Two unrelated images that both contain the same Python
   interpreter, in different layers, store and download it twice.
 
-So the same bytes cross the network and fill up disks many times, both when images are pushed and when they're
-pulled.
+So the same bytes cross the network and fill up disks many times. In this project, uploading `python:3.11-slim`
+after `python:3.12-slim` stores only 33.7 MB of its 125.5 MB, because the rest are files 3.12 already has.
 
 ### Why it matters
 
@@ -98,8 +150,8 @@ The video combines four ideas:
 1. **Content-addressed storage.** Name each file's content by its checksum (for example SHA-256), not by its
    path. The same content always gets the same name, so it's stored exactly once, however many images
    contain it.
-2. **An index per image.** An image becomes a small list of `path → checksum`, plus a shared pool of contents
-   ("blobs"). The index is tiny compared to the image.
+2. **An index per image.** An image becomes a small list of `path → checksum` (plus folders, symlinks and
+   permissions), and a shared pool of contents ("blobs"). The index is tiny compared to the image.
 3. **Lazy loading.** Show the container a complete file system right away (Modal does this with FUSE), but
    fetch a file's content only when the container actually reads it. Files that are never read are never
    downloaded.
@@ -107,158 +159,137 @@ The video combines four ideas:
    image on that machine that needs the same content reuses it. Content behind a checksum never changes, so it
    can be cached forever.
 
-Both problems are solved: ideas 3 and 4 stop the machine from moving data that's never read, and ideas 1, 2
-and 4 make sure each unique file is stored and moved only once.
-
 ---
 
 ## 4. What this project builds
 
-A **Django REST API** that acts as a tiny image registry built on those four ideas, plus a small **Python
-client** (`imagestore/client.py`) with two parts:
+| Part | What it does | Where |
+|---|---|---|
+| Registry API | Stores each file once by checksum, keeps an index per image, takes pushes that upload only missing files, and can hand out a whole image as one tar | `imagestore/` (Django app) |
+| Lazy file system | Mounts an image with FUSE. Folder listings and file info come from the index. A file is downloaded on first open, checked, and cached by checksum | `imagestore/lazyfs.py` |
+| Client and CLI | `push` an image, `pull` it the usual way, or `mount` it lazily. Uses only the standard library, apart from FUSE for `mount` | `imagestore/client.py`, `imagestore/__main__.py` |
+| The proof | Starts real containers both ways on three network conditions and times them | `demo.sh`, recorded in `demo.cast` |
 
-- `push_tar()` uploads an image and sends only the files the server doesn't have yet.
-- `LazyImage` plays the role of the lazy file system on a machine starting containers.
+How each idea from the video maps to the code:
 
-| Idea from the video | Where it is in this project |
+| Idea from the video | Where it is |
 |---|---|
-| Store files by checksum, once | `imagestore/storage.py` (`save_blob`) and the `Blob` model |
-| An index per image | The `ImageFile` model and `GET /api/images/{id}/index/` |
-| Don't move data the server already has | `push_tar()`, with `POST /api/blobs/missing/`, `PUT /api/blobs/{checksum}/` and `POST /api/images/push/` |
-| Fetch a file only when it's read | `LazyImage.read()` and `GET /api/blobs/{checksum}/` |
-| Local cache named by checksum | `LazyImage`'s cache folder |
-| "Like a CDN": cache forever | `Cache-Control: immutable` and `ETag` headers on blob downloads |
-| Trust the content | The server re-hashes every upload; `LazyImage` re-hashes every download |
-
-What it deliberately doesn't do (see [section 11](#11-whats-simplified-and-what-a-real-system-would-add)): it
-doesn't run containers, and it doesn't mount a real file system with FUSE. `LazyImage.read(path)` stands in for
-"the container opened a file".
+| Store files by checksum, once | `storage.save_blob()` and the `Blob` model |
+| An index per image | The `ImageFile` model (files, folders, symlinks, modes, mtimes) and `GET /api/images/{id}/index/` |
+| Show the whole file system right away | `LazyFS.getattr` / `readdir` / `readlink`, answered from the index |
+| Fetch a file only when it's opened | `LazyFS.open()`, which calls `BlobCache.path()` and downloads `GET /api/blobs/{checksum}/` |
+| Local cache named by checksum | `BlobCache`, shared by every image mounted on the machine |
+| "Like a CDN": cache forever | `Cache-Control: immutable` on blobs, and kernel caching options on the mount |
+| Don't move data the server already has | `push_tar()` with `POST /api/blobs/missing/` and `PUT /api/blobs/{checksum}/` |
+| Trust the content | The server re-hashes every upload; the client re-hashes every download |
 
 ---
 
 ## 5. How it works, step by step
 
-There are two ways to get an image in, and one way to use it.
-
 ```text
- A) UPLOAD A WHOLE TAR (one request; handy with curl)
+ A) GET AN IMAGE IN (once)
 
-  .tar of the image ──► POST /api/images/ ──► services.import_tar()
-                                                for each file in the tar:
-                                                  1. compute its SHA-256 checksum
-                                                  2. store the content under that checksum,
-                                                     unless it's already stored
-                                                  3. add "path → checksum" to the image's index
-
-
- B) PUSH ONLY WHAT'S MISSING (client.push_tar; this is what the demo uses)
-
-  on the developer's machine                              on the server
-  1. read the tar, compute every file's SHA-256
-  2. POST /api/blobs/missing/  {"digests": [...]}   ──►   which of these don't I have?
-                                                    ◄──   {"missing": [...]}
-  3. for each missing checksum only:
-     PUT /api/blobs/{checksum}/   (the raw bytes)   ──►   hash the bytes; they must match the URL;
-                                                          store them under that checksum
-  4. POST /api/images/push/                         ──►   every listed blob must exist,
-     {"name", "tag", "files": [{"path", "digest"}]}       then save the index
+  docker export → image.tar ──► POST /api/images/            (whole tar, one request)
+                       or  ──► python3 -m imagestore push    (only files the server lacks)
+                                     │
+                                     ▼
+              Database (SQLite)                               blobstore/ folder
+              Image      python:3.12-slim                     1d/1d3791eb…   file contents,
+              ImageFile  /usr/local/bin/python3.12 → 1d37…    ad/ad82e165…   named by checksum
+                         /bin → usr/bin (symlink), /etc (folder, 0755), …
 
 
- Either way, the server ends up with:
+ B) START A CONTAINER THE LAZY WAY (python3 -m imagestore mount …)
 
-              Database (SQLite)                                        blobstore/ folder
-              Image      demo/webapp:1.0                               1d/1d3791eb…   file contents,
-              ImageFile  /usr/bin/python3 → 1d3791eb…  (the index)     ad/ad82e165…   named by checksum
-              Blob       1d3791eb…, 2,500,000 bytes                    …
+  1. GET /api/images/?name=python&tag=3.12-slim     find the image
+  2. GET /api/images/1/index/                        5,580 entries, about 1 MB, no file contents
+  3. mount the FUSE file system on mnt/               the container sees every file immediately
+  4. unshare … chroot mnt/ /usr/local/bin/python3     the container starts
+  5. Python opens a file ──► LazyFS.open()
+                               checksum in the local cache?   yes → open the cached copy
+                                                               no  → GET /api/blobs/{checksum}/,
+                                                                     check SHA-256, save, open
 
 
- C) START A CONTAINER (on any machine, with client.LazyImage)
+ C) START A CONTAINER THE USUAL WAY (python3 -m imagestore pull …), for comparison
 
-  LazyImage(server, image_id, cache_dir)
-    1. GET /api/images/{id}/index/    → every path and its checksum (small, no file contents)
-
-  lazy.read("/usr/bin/python3")
-    2. look up the path's checksum in the index
-    3. is a file with that checksum in the local cache?
-         yes → read it from the cache, no download
-         no  → GET /api/blobs/{checksum}/ → check the SHA-256 → save it in the cache
+  1. GET /api/images/1/tar/                           the whole image as one tar, streamed
+  2. unpack it into rootfs/
+  3. unshare … chroot rootfs/ /usr/local/bin/python3
 ```
 
-### What the database looks like after two versions
+### What "container" means here
 
-```text
-Image        id=1  demo/webapp:1.0        id=2  demo/webapp:2.0
-
-ImageFile    image=1  /usr/bin/python3  → blob 1d37…   ┐ same blob, stored once
-             image=2  /usr/bin/python3  → blob 1d37…   ┘
-             image=1  /app/main.py      → blob ad82…   ┐ different content,
-             image=2  /app/main.py      → blob d038…   ┘ different blobs
-
-Blob         1d37…  2,500,000 bytes
-             ad82…  36 bytes
-             d038…  36 bytes
-```
+`demo.sh` runs the program with `unshare --user --map-root-user --mount --pid --net --uts --ipc --fork chroot
+<root> …`. That gives it its own user, mount, PID, network, hostname and IPC namespaces, and its own root file
+system. Inside, it's PID 1 and root; outside, it's your normal user, so no `sudo` is needed. Those are the Linux
+features a container runtime like `runc` sets up. What's missing compared with a full runtime: cgroups
+(resource limits), seccomp filters and dropped capabilities. A real setup would hand the mount to `runc` or
+containerd as the root file system.
 
 ### Details worth knowing
 
-- **Why the checksum is a good name:** SHA-256 gives a different 64-character value for any different
-  content, and the same value for the same content. The name proves what the content is: anyone can
-  recompute it.
-- **Safe writes:** a blob is written to a temporary file, flushed to disk (`fsync`), and then renamed to its
-  checksum in one step. A half-written or lost-in-a-crash file never appears under a checksum name. That
-  matters because a blob that already exists is never written again. The client's cache does the same.
-- **Safe uploads:** the tar is never unpacked onto disk. Files are stored by the checksum the server computes,
-  so a path inside the tar can't decide where anything is written. Paths with `..` are still rejected to keep
-  the index clean.
-- **Pushed data is checked:** the server hashes every `PUT` and refuses bytes that don't match the checksum in
-  the URL. A push is refused, with the list of missing checksums, if any file in the index hasn't been
-  uploaded yet.
-- **Limits:** `IMAGE_MAX_SIZE` (2 GB) and `IMAGE_MAX_ENTRIES` (100,000) in `settings.py`. For a tar they're
-  checked from the tar headers before anything is written. Without them, a 48 KB `.tar.gz` of zeros could
-  unpack into 50 MB on disk (or much more). They also cap a single `PUT` and the size of a pushed index.
-- **The client doesn't blindly trust the server:** every checksum in an index must be a real SHA-256 before it
-  is used as a cache file name. Otherwise a bad index could say a file's checksum is `../../.ssh/id_rsa`, and
-  the client would hand that local file to the container. Every download is also re-hashed.
-- **All or nothing:** saving an image runs in a database transaction. If anything fails (for example a bad
-  path), no image is saved. Blob files already written stay on disk; they're harmless, and a later upload
-  reuses them.
-- **Pushing a name and tag again replaces that image**, the way pushing a new build of a tag to a registry works.
+- **Why the checksum is a good name:** SHA-256 gives a different value for any different content and the same
+  value for the same content, so the name proves what the content is.
+- **The index keeps what a real file system needs:** folders, symlinks (`/bin → usr/bin`), permission bits
+  and modification times.
+  - **Modification times matter for speed.** Python only trusts its cached `.pyc` files when the `.py` file's
+    mtime matches. Without mtimes, every start would recompile the standard library.
+  - **Owners aren't kept.** Everything belongs to whoever mounted the image, which shows up as root inside the
+    container.
+- **The mount is read-only, and the kernel may cache everything.** An image never changes, so file contents,
+  attributes and even "this file doesn't exist" answers are cached. The last one matters for Python, whose
+  imports look up many files that aren't there.
+- **Safe writes:** blobs and cached files are written to a temp file, `fsync`ed and renamed into place, so a
+  half-written file never appears under a checksum name.
+- **Safe uploads:** the tar is never unpacked on the server. Contents are stored under the checksum the server
+  computes, `..` paths are rejected, and size and entry limits (`IMAGE_MAX_SIZE`, `IMAGE_MAX_ENTRIES`) are
+  checked from the tar headers before anything is written.
+- **The client doesn't blindly trust the server:** checksums in an index must be real SHA-256 values before
+  they become cache file names, and every download is re-hashed (`ChecksumMismatch` otherwise).
+- **All or nothing:** saving an image runs in one database transaction. Pushing a name and tag again replaces
+  that image, like a registry does.
 
 ---
 
 ## 6. Code tour
 
 ```text
-E2E_Second/
+e2e-second-round-task/
 ├── README.md                  this file
-├── requirements.txt           Django and Django REST Framework
+├── CLAUDE.md                  notes for AI coding assistants working in this repo
+├── demo.sh                    the proof: starts real containers both ways and times them
+├── demo.cast                  screencast of demo.sh (asciinema)
+├── requirements.txt           Django, Django REST Framework, mfusepy
 ├── manage.py
-├── e2e_second/                Django project settings
-│   ├── settings.py            adds rest_framework + imagestore, BLOB_STORAGE_DIR and the upload limits
-│   └── urls.py                mounts the API under /api/
-└── imagestore/                the app that does the work
-    ├── models.py              Blob, Image, ImageFile (the database tables)
-    ├── storage.py             saves and opens file contents by checksum on disk
-    ├── services.py            import_tar() for a whole tar, push_image() for a pushed index
-    ├── serializers.py         JSON output for images, the upload form and the push body
+├── e2e_second/                Django project settings (DATA_DIR, BLOB_STORAGE_DIR, limits)
+└── imagestore/
+    ├── models.py              Blob, Image, ImageFile
+    ├── storage.py             saves and opens blobs on disk, by checksum
+    ├── services.py            import_tar(), push_image(), save_image(), export_tar()
+    ├── serializers.py         upload form, push body, JSON output
     ├── views.py               the API endpoints
-    ├── urls.py                the API's URLs
-    ├── admin.py               shows images and blobs in Django admin
-    ├── client.py              push_tar() and LazyImage (standard library only)
+    ├── urls.py
+    ├── client.py              BlobCache, Link, fetch_index(), pull_image(), push_tar(), LazyImage
+    ├── lazyfs.py              the FUSE file system
+    ├── __main__.py            CLI: python3 -m imagestore push | pull | mount
+    ├── admin.py
     ├── management/commands/
-    │   └── demo.py            `python3 manage.py demo`: shows both problems being solved
-    └── migrations/            database migrations
+    │   └── demo.py            quick demo without FUSE or Docker: python3 manage.py demo
+    └── migrations/
 ```
 
-Suggested reading order: `models.py` → `storage.py` → `services.py` → `views.py` → `client.py` → `demo.py`.
+Suggested reading order: `models.py` → `storage.py` → `services.py` → `views.py` → `client.py` → `lazyfs.py` →
+`demo.sh`.
 
 **The three models**
 
 | Model | One row means | Key fields |
 |---|---|---|
 | `Blob` | One unique file content, stored once | `digest` (SHA-256, the primary key), `size` |
-| `Image` | One image, such as `demo/webapp:1.0` | `name`, `tag`, `file_count`, `total_size` |
-| `ImageFile` | One line of an image's index: this path has that content | `image`, `path`, `blob` |
+| `Image` | One image, such as `python:3.12-slim` | `name`, `tag`, `file_count`, `total_size` |
+| `ImageFile` | One entry of an image's file system: a file, folder or symlink | `image`, `path`, `kind`, `mode`, `mtime`, `target`, `blob` (files only) |
 
 `ImageFile.blob` uses `on_delete=PROTECT`, so a blob that an image still uses can't be deleted by accident.
 
@@ -268,31 +299,31 @@ Suggested reading order: `models.py` → `storage.py` → `services.py` → `vie
 
 | Method and URL | What it does |
 |---|---|
-| `POST /api/images/` | Upload a whole image in one request: multipart form with `name`, `tag` and `file` (a `.tar` or `.tar.gz`). |
+| `POST /api/images/` | Upload a whole image: multipart form with `name`, `tag` and `file` (a `.tar` or `.tar.gz`). |
 | `POST /api/blobs/missing/` | Push, step 1: send `{"digests": [...]}`, get back `{"missing": [...]}`. |
 | `PUT /api/blobs/{checksum}/` | Push, step 2: upload one file's raw bytes. They must hash to the checksum in the URL. |
-| `POST /api/images/push/` | Push, step 3: create the image from `{"name", "tag", "files": [{"path", "digest"}]}`. |
-| `GET /api/images/` | List images, 50 per page: `{"count", "next", "previous", "results"}`. |
+| `POST /api/images/push/` | Push, step 3: create the image from `{"name", "tag", "entries": [...]}`. Each entry has `path`, `kind` (`file`, `dir` or `symlink`), `mode`, `mtime`, and `digest` for files or `target` for symlinks. |
+| `GET /api/images/` | List images, 50 per page. `?name=python&tag=3.12-slim` finds one. |
 | `GET /api/images/{id}/` | One image. |
-| `GET /api/images/{id}/index/` | The image's index: every path with its checksum and size, no file contents. |
+| `GET /api/images/{id}/index/` | The index: every entry with `path`, `kind`, `mode`, `mtime`, `target`, `digest`, `size`. No file contents. |
+| `GET /api/images/{id}/tar/` | The whole image as one streamed tar. This is what the usual way downloads. |
 | `GET /api/blobs/{checksum}/` | The raw bytes of one file. Cacheable forever. |
 | `GET /api/stats/` | How much space deduplication saves across all images. |
 
 There's no login: anyone who can reach the API can read and upload (see
-[section 11](#11-whats-simplified-and-what-a-real-system-would-add)). You can also open
-`http://127.0.0.1:8000/api/` in a browser. DRF's browsable API lets you click through the images and upload a
-`.tar` with a form.
+[section 11](#11-whats-simplified-and-what-a-real-system-would-add)). `http://127.0.0.1:8000/api/` also works in
+a browser, through DRF's browsable API.
 
 **Examples** (with the server running):
 
 ```bash
-curl -F name=demo/hello -F tag=1.0 -F file=@image.tar http://127.0.0.1:8000/api/images/
+curl -F name=python -F tag=3.12-slim -F file=@python.tar http://127.0.0.1:8000/api/images/
 ```
 
 ```json
 {
-  "image": {"id": 1, "name": "demo/hello", "tag": "1.0", "file_count": 2, "total_size": 33, "created_at": "…"},
-  "stats": {"files": 2, "total_bytes": 33, "new_bytes_stored": 33, "bytes_saved_by_dedup": 0}
+  "image": {"id": 1, "name": "python", "tag": "3.12-slim", "file_count": 4416, "total_size": 119827876, "created_at": "…"},
+  "stats": {"files": 4416, "total_bytes": 119827876, "new_bytes_stored": 115407247, "bytes_saved_by_dedup": 4420629}
 }
 ```
 
@@ -302,36 +333,17 @@ curl http://127.0.0.1:8000/api/images/1/index/
 
 ```json
 {
-  "image": {"id": 1, "name": "demo/hello", "tag": "1.0", "file_count": 2, "total_size": 33, "created_at": "…"},
-  "files": [
-    {"path": "/app/main.py", "digest": "03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824", "size": 15},
-    {"path": "/etc/os-release", "digest": "1f23edd073b62977457058dfc878b29badae6c593508b347e543a17655ba1124", "size": 18}
+  "image": {"id": 1, "name": "python", "tag": "3.12-slim", "file_count": 4416, "total_size": 119827876, "created_at": "…"},
+  "entries": [
+    {"path": "/", "kind": "dir", "mode": 493, "mtime": 0, "target": "", "digest": null, "size": 0},
+    {"path": "/bin", "kind": "symlink", "mode": 511, "mtime": 1784307900, "target": "usr/bin", "digest": null, "size": 0},
+    {"path": "/usr/local/bin/python3.12", "kind": "file", "mode": 493, "mtime": 1793865609, "target": "", "digest": "…", "size": 14472},
+    "…"
   ]
 }
 ```
 
-```bash
-curl -i http://127.0.0.1:8000/api/blobs/03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824/
-```
-
-```text
-HTTP/1.1 200 OK
-Content-Type: application/octet-stream
-Content-Length: 15
-Cache-Control: public, max-age=31536000, immutable
-ETag: "03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824"
-
-print('hello')
-```
-
-Pushing with the Python client (run it from the project folder; `client.py` only uses the standard library):
-
-```python
-from imagestore.client import push_tar
-
-image, uploaded, skipped = push_tar("http://127.0.0.1:8000", "image.tar", "demo/hello", "2.0")
-print(f"uploaded {uploaded} bytes, skipped {skipped} bytes the server already had")
-```
+(`mode` is shown in decimal: 493 is `0o755`, 511 is `0o777`.)
 
 Errors come back as JSON:
 
@@ -341,63 +353,82 @@ Errors come back as JSON:
 - **411:** a `PUT` without a `Content-Length` header.
 - **413:** a `PUT` larger than the size limit.
 
-To try a real image (needs Docker), export its files to a tar and upload or push it:
+---
+
+## 8. Run it
+
+Needs Linux with FUSE 3 (`fusermount3` and `libfuse3`), unprivileged user namespaces (check that
+`unshare --user --map-root-user true` works), Python 3.10 or newer, and `curl`. The demo also needs Docker, only
+to export the two sample images the first time.
+
+```bash
+python3 -m venv venv
+```
+
+```bash
+venv/bin/pip install -r requirements.txt
+```
+
+```bash
+venv/bin/python manage.py migrate
+```
+
+Then run the proof. It starts its own server on port 8765 with its own throwaway database in `demo-work/`, so
+it never touches your data:
+
+```bash
+./demo.sh
+```
+
+To try it by hand instead, run `venv/bin/python manage.py runserver` in one terminal, upload a tar as in
+[section 7](#7-api-reference), then:
+
+```bash
+mkdir -p /tmp/py && venv/bin/python -m imagestore mount python:3.12-slim /tmp/py --cache /tmp/py-cache &
+```
+
+```bash
+unshare --user --map-root-user chroot /tmp/py /usr/local/bin/python3 -c 'print("hello")'
+```
+
+```bash
+fusermount3 -u /tmp/py
+```
+
+When the mount ends, it prints how many files it downloaded. `--bandwidth 100 --latency 10` on `mount` or `pull`
+simulates a slower network.
+
+To get a tar of a real image:
 
 ```bash
 docker export $(docker create python:3.12-slim) -o python.tar
 ```
 
-```bash
-curl -F name=python -F tag=3.12-slim -F file=@python.tar http://127.0.0.1:8000/api/images/
-```
+If you set up the project before folders and symlinks were added, run `migrate` again, then re-upload your
+images so their indexes include them. To start over with an empty store, delete `db.sqlite3` and `blobstore/`
+and run `migrate`.
+
+Outside local development, set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=0` and `DJANGO_ALLOWED_HOSTS`
+(comma-separated). `IMAGESTORE_DATA_DIR` moves the database and blob store somewhere else.
 
 ---
 
-## 8. Run it
+## 9. The demos and what their numbers mean
 
-Needs Python 3.10 or newer.
+### `./demo.sh`: real containers, timed
 
-```bash
-pip install -r requirements.txt
-```
+What it does:
+1. Uploads `python:3.12-slim` and `python:3.11-slim`.
+2. Starts Python in a container from each image, on localhost and then on two simulated links.
+3. Prints the table shown under [Results](#results).
 
-```bash
-python3 manage.py migrate
-```
+Each lazy start uses an empty cache, except the second start and the `python:3.11` one, which show what the
+cache brings. The output also lists how many files and bytes each start downloaded.
 
-```bash
-python3 manage.py runserver
-```
+### `python3 manage.py demo`: a quick version without FUSE or Docker
 
-Then, in a second terminal:
-
-```bash
-python3 manage.py demo
-```
-
-Optional: to browse images and blobs in Django admin at `http://127.0.0.1:8000/admin/`, create a user first:
-
-```bash
-python3 manage.py createsuperuser
-```
-
-To start over with an empty store, stop the server and delete `db.sqlite3` and the `blobstore/` folder, then
-run `migrate` again.
-
-Outside local development, set these environment variables instead of relying on the defaults in
-`settings.py`: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=0` and `DJANGO_ALLOWED_HOSTS` (comma-separated).
-
----
-
-## 9. The demo and what its numbers mean
-
-`python3 manage.py demo` builds two versions of a made-up Python web app image and runs the whole solution
-through the API. The images are synthetic but shaped like real ones: a few files are needed to start the app
-(the interpreter, some standard library modules, the app's code), and most bytes are things a running app
-never opens (the standard library's test suite, a static library, translations, package docs). Version 2.0
-changes the app and applies a "security fix" to one library.
-
-Output from a fresh database:
+It uses two made-up 33 MB images and `LazyImage`, which reads files through the cache without mounting
+anything. Its output on an empty database:
 
 ```text
 Step 1: push two versions of demo/webapp. Only files the server doesn't have are uploaded.
@@ -409,25 +440,10 @@ Step 1: push two versions of demo/webapp. Only files the server doesn't have are
 Step 2: start both versions on a fresh machine. Starting the app reads 25 files.
   demo/webapp:1.0   downloaded 3.9 MB of 33.4 MB (12%)   files found in the machine's cache: 0
   demo/webapp:2.0   downloaded 0.7 MB of 33.4 MB (2%)    files found in the machine's cache: 22
-
-  A normal pull would download the whole image (33.4 MB) before the app could start.
 ```
 
-How to read it:
-
-- **Step 1 solves Problem 2 (duplicate data) on the way up.** Version 2.0 is 33.4 MB of files, but only 0.7 MB
-  of it is new (the changed library and app files). `push_tar` asks the server which checksums it's missing and
-  uploads just those, so only 0.7 MB crosses the network and only 0.7 MB more is stored. Uploading the
-  version 2.0 tar in one piece would send all 34 MB. With Docker layers, the changed library would make its
-  whole base layer new.
-- **Step 2 solves Problem 1 (data that's never read).** Starting version 1.0 downloads only the 25 files it
-  reads: 3.9 MB instead of 33.4 MB.
-- **Step 2 also shows the cache.** Starting version 2.0 on the same machine finds 22 of its 25 files already in
-  the cache (same checksums), so it downloads only the 3 changed files: 0.7 MB.
-
-The first push takes a few seconds, because each of its 760 files is a separate request. If you run the demo
-again, step 1 shows `uploaded: 0.0 MB` for both versions: the server already has every file from the first
-run. Step 2 always starts with an empty cache, so its numbers stay the same.
+It shows the two-step push: version 2.0 uploads only the 0.7 MB that changed. It needs the API running
+(`runserver`).
 
 ---
 
@@ -435,96 +451,95 @@ run. Step 2 always starts with an empty cache, so its numbers stay the same.
 
 ### A two-minute version
 
-1. A container starts from an image: a bundle of every file a program needs. Normally a machine downloads the
-   whole image before the program can start.
-2. That wastes two things. Most of an image is never read (one study found only about 6% of the downloaded
-   data is). And the same files are stored, uploaded and downloaded again and again, because Docker only shares
-   whole layers.
-3. Modal solved this with their own file system. They store every file by its checksum, so identical files
-   exist once. Each image is just an index of `path → checksum`. Containers see all their files immediately, but
-   a file is downloaded only when it's read, and then cached on the machine.
-4. My project builds that idea with Django REST Framework. Pushing an image first asks the server which
-   checksums it's missing, uploads only those files, then sends the index. The index endpoint returns an image's
-   paths and checksums without any contents. The blob endpoint returns one file's bytes by checksum, cacheable
-   forever. The `LazyImage` client downloads the index, fetches files only when they're read, checks every
-   checksum, and caches by checksum.
-5. In the demo, pushing version 2.0 of a 33 MB image uploads only 0.7 MB, and the two versions take 34 MB of
-   storage instead of 67 MB. Starting the app downloads 3.9 MB instead of 33.4 MB, and starting the second
-   version afterwards downloads only 0.7 MB.
+1. A container starts from an image, a bundle of every file a program needs. Normally a machine downloads and
+   unpacks the whole image before the program can start.
+2. That wastes two things. Most of an image is never read (Python reads 19% of `python:3.12-slim` to start).
+   And the same files are stored and moved again and again, because Docker only shares whole layers.
+3. Modal's answer is a lazy, content-addressed file system: store every file once by checksum, describe each
+   image as an index of paths and checksums, show the container the whole file system right away, and download
+   a file only when it's opened, caching it by checksum on the machine.
+4. I built exactly that:
+   - A Django REST registry stores files by checksum and serves indexes and blobs.
+   - A FUSE file system mounts an image from it: listings and file info come from the index, and file
+     contents are downloaded on first open, verified and cached.
+   - `demo.sh` starts real Python containers, rootless with their own namespaces, both from the lazy mount and
+     the usual way (download everything, unpack, start).
+5. Results: on a 100 Mbit/s link, start-up goes from 10.1 s to 4.0 s, and the lazy way downloads 22.5 MB instead
+   of 124 MB. The next image reuses cached files and needs only 7.2 MB. On a fast local network it's about even,
+   because each file costs a round trip. The next step is prefetching the start-up files in parallel.
 
 ### Questions you might get
 
-**Why SHA-256?** It's the standard checksum for this; Docker and OCI image digests use it too. For practical
-purposes, two different files never get the same SHA-256.
+**Why FUSE?** It lets a normal program be a file system, so the container sees ordinary files while my code
+decides when to fetch them. Modal's first prototype was also FUSE in Python. In production you'd write it in
+Rust or Go, or use the kernel's EROFS with fscache, as Nydus does.
 
-**How does the client know a download is correct?** The checksum is the file's name. The client recomputes
-the SHA-256 of what it downloaded and refuses it if it doesn't match (`ChecksumMismatch`). The server does the
-same with every `PUT`.
+**Isn't a FUSE file system written in Python slow?** It adds overhead to every file access. You can see it in
+the second start: 0.32 s from the cache against 0.14 s from an unpacked folder. It doesn't change the big
+picture, though: the cold start is dominated by downloads, and that's where laziness wins.
 
-**Why push file by file instead of uploading one tar?** So nothing the server already has crosses the network.
-The trade-off is one request per missing file. That's fine here, but a real system would upload in parallel or
-pack small files together. The one-request tar upload is still there for quick tests with curl.
+**Why is the lazy way not faster on localhost or 1 Gbit/s?** Python opens about 85 files one after another, and
+each first open waits for a download, so each one costs a round trip. When the network is almost free, that
+adds up to about what a bulk download costs. The fix is prefetching: record the start-up files once per image
+and download them in parallel at mount time.
 
-**What if two uploads store the same file at the same time?** Both write identical bytes to temporary files
-and rename them to the same checksum name. The rename is atomic and the content is the same, so it doesn't
-matter which one wins. The database row is created with `get_or_create`, which handles the race.
+**How did you simulate the network, and is that fair?** `Link` in `client.py` adds latency before each request
+and keeps every download to the chosen bandwidth. Both ways use it the same way, so the comparison is fair. It
+doesn't model TCP slow start or packet loss, and real networks are usually worse than the simulation, which
+favours the lazy way even more.
 
-**Isn't the first read of each file slower?** Yes, it has network delay. Real systems reduce it by caching
-on local SSDs (as Modal does), serving blobs from a CDN close to the machines, and prefetching files that
-containers usually read at start. Overall it's still far faster than downloading the whole image first.
+**Why keep modification times?** Python checks the `.py` file's mtime before trusting the cached `.pyc`. Without
+it, every start would recompile the standard library and try to write `.pyc` files to a read-only mount.
 
-**Why not just use Docker layers?** Layers are all or nothing. A one-file change makes a whole new layer, the
-same file in two different layers is stored twice, and a container can't start until all layers are
-downloaded and unpacked.
+**Is `unshare` plus `chroot` a real container?** It has the isolation a container gets from namespaces, but no
+cgroups, seccomp or dropped capabilities. The next step would be pointing `runc`'s `root.path` at the mount, or
+writing a containerd snapshotter, which is what stargz-snapshotter does.
 
-**Who can upload?** Anyone who can reach the API; there's no login, to keep the project small. In production
-I'd add DRF authentication with `IsAuthenticatedOrReadOnly`, so pulling stays public and pushing needs a user.
+**Why is there a tar export endpoint?** For a fair baseline. The usual way should download the image in one
+stream, the way `docker pull` downloads layers, not in 4,400 small requests.
 
-**Is uploading a malicious tar dangerous?** The tar is never unpacked to disk, contents are stored under
-checksums the server computes, and `..` paths are rejected. Size and entry limits stop archives that unpack
-into huge amounts of data, and saving an image is all-or-nothing.
+**Why SHA-256?** It's the standard checksum for this, and Docker and OCI digests use it too. There are no
+practical collisions.
+
+**What if two uploads store the same file at once?** Both write identical bytes to temp files and rename them to
+the same name. The rename is atomic and the content is identical, so it doesn't matter which one wins.
+`get_or_create` handles the database row.
 
 **Can a broken or hostile server trick the client?** It can't make the client accept wrong content, because
-every download is re-hashed. It also can't make the client read local files: checksums in the index must be
-real SHA-256 values before they're used as cache file names.
+every download is re-hashed. It can't make it read local files either: index checksums must be real SHA-256
+values before they become cache file names.
 
-**Why are the blob endpoints a plain Django view, not DRF?** They move raw bytes. DRF is great for validating
-and producing JSON, which the other endpoints use, but here it would add nothing.
+**Who can upload?** Anyone who can reach the API; there's no login, to keep the project small. In production I'd
+add DRF authentication with `IsAuthenticatedOrReadOnly`, so pulling stays public and pushing needs a user.
 
-**Where would FUSE fit in?** A FUSE file system would answer "list folder" and "file info" requests from the
-index, and call `LazyImage.read` when a file is opened. That's how the container would see a normal folder.
-
-**How would this scale?** Put blobs in object storage (such as S3) behind a CDN, use PostgreSQL, require a
-login for uploads, and garbage-collect blobs no image uses anymore.
+**How would this scale?** Blobs in object storage behind a CDN, Postgres, login for uploads, garbage collection
+of unused blobs, a shared cache per machine (one daemon), and prefetching. Large files would be chunked, so a
+program reading part of a file downloads only that part.
 
 ---
 
 ## 11. What's simplified, and what a real system would add
 
-Kept out on purpose, to keep the project small and easy to follow:
-
-- **No FUSE mount and no container runtime.** `LazyImage.read()` stands in for a container opening a file.
-- **No login.** Anyone who can reach the API can upload, push or replace images. Production needs
-  authentication in front of the write endpoints.
-- **Only regular files are indexed.** Folders, symlinks, permissions and owners are skipped (hard links are
-  kept). A real image index needs all of them.
-- **Whole files only.** Large files would be split into chunks so a program reading part of a file downloads
-  only that part.
-- **One request per missing file when pushing.** A real system would upload in parallel or pack small files
-  together.
-- **No prefetching.** Real systems download the files a container usually needs at start in the background.
-- **No garbage collection.** Blobs that no image uses anymore (after a tag is replaced, or pushed but never
-  used) stay on disk.
-- **No special handling for concurrent pushes.** SQLite allows one writer at a time, and two pushes of the
-  same tag at the same moment aren't turned into a clean `409 Conflict`.
-- **Request size isn't capped before Django receives the upload.** In production, a proxy (for example
-  nginx's `client_max_body_size`) should cap it. Python's `tarfile` also reads some header data fully into
-  memory, so a crafted archive can still use a lot of memory.
-- **The client reads each file into memory.** Fine for the demo; a real file system would stream.
-- **Blobs live on local disk and data in SQLite.** In production: object storage plus a CDN, and PostgreSQL.
+- **No prefetching.** The next step: record which files an image reads at start-up, then download them in
+  parallel when it's mounted. That removes the per-file round trips that make the lazy way about even on fast
+  networks.
+- **The file system is written in Python.** It's easy to read but adds overhead to every file access. Production
+  versions are in Rust or Go, or use the kernel (EROFS with fscache).
+- **Whole files only.** A big library is downloaded in full the first time it's opened. Splitting files into
+  chunks would let a program fetch only the parts it reads.
+- **The container is `unshare` plus `chroot`.** There are no cgroups, seccomp or dropped capabilities.
+  Integrating with `runc` or containerd is the next step.
+- **Owners aren't kept** (everything belongs to whoever mounts the image), and device files are skipped.
+- **The cache never evicts anything**, and each mount has its own cache object. A real machine would run one
+  cache daemon shared by all its containers.
+- **No login, and no garbage collection** of blobs that no image uses anymore.
+- **One request per missing file when pushing.** Fine for small images; `demo.sh` uploads whole tars instead.
+- **The network simulation** caps each download separately and adds a fixed latency per request. It's good
+  enough to compare the two ways, not to predict exact times on a real network.
+- **SQLite and local disk.** In production: Postgres, plus object storage behind a CDN.
 
 Related open-source projects that do this for real: Nydus (part of the Dragonfly project), Dragonfly, and
-stargz / eStargz for containerd.
+stargz-snapshotter (eStargz) for containerd.
 
 ---
 
@@ -532,21 +547,23 @@ stargz / eStargz for containerd.
 
 | Term | Meaning |
 |---|---|
-| Container | A program running in isolation, with its own view of the file system. |
+| Container | A program running in isolation, with its own namespaces and its own root file system. |
 | Image | Everything a container needs to start: all its files plus some settings. |
 | Layer | A Docker image is a stack of layers; each layer is a tar of files added or changed. |
-| Registry | A server that stores images, such as Docker Hub. |
+| Registry | A server that stores images, such as Docker Hub. This project's API plays that role. |
 | Pull / push | Downloading an image from / uploading an image to a registry. |
-| Two-step push | Asking the server which checksums it's missing, uploading only those, then sending the index. |
 | Root file system | The folder a container sees as `/`. |
-| Container runtime, `runc` | The program that actually starts a container from a root file system. |
+| Namespace | A Linux feature that gives a process its own view of something: PIDs, mounts, network, users… |
+| `unshare`, `chroot` | Commands that start a program in new namespaces, and with a different root folder. |
+| Container runtime, `runc` | The program that normally starts a container from a root file system. |
 | FUSE | "Filesystem in Userspace": lets a normal program act as a file system. |
+| Mount, mountpoint | Attaching a file system to a folder (the mountpoint), so its files appear there. |
 | Checksum, SHA-256 | A fixed-length fingerprint computed from content. Same content, same checksum. |
 | Content-addressed storage | Storing data under its checksum instead of a path or name. |
 | Blob | One stored file content, named by its checksum. |
-| Index | An image's list of `path → checksum`. |
+| Index | An image's list of entries: each path with its kind, permissions, mtime, and checksum or symlink target. |
+| `.pyc` | Python's cached compiled version of a `.py` file, trusted only if the `.py` mtime matches. |
 | Deduplication | Storing identical data only once. |
 | Lazy loading | Fetching data only when it's actually needed. |
-| Cache | A local copy kept so the same data isn't fetched twice. |
-| CDN | A network of servers that keeps copies of content close to users. |
+| Prefetching | Fetching data you expect to need before it's asked for. |
 | Cold start | The delay before a freshly started container can do its work. |

@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.db.models import Count, Sum
-from django.http import FileResponse, JsonResponse
+from django.http import FileResponse, JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from rest_framework import status, viewsets
@@ -12,12 +12,16 @@ from rest_framework.response import Response
 from . import storage
 from .models import Blob, Image, ImageFile
 from .serializers import ImagePushSerializer, ImageSerializer, ImageUploadSerializer, MissingBlobsSerializer
-from .services import InvalidImage, MissingBlobs, import_tar, push_image
+from .services import InvalidImage, MissingBlobs, export_tar, import_tar, push_image
 
 
 class ImageViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Image.objects.all()
     parser_classes = [MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        wanted = {key: value for key, value in self.request.query_params.items() if key in ("name", "tag")}
+        return Image.objects.filter(**wanted)
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -43,23 +47,30 @@ class ImageViewSet(viewsets.ReadOnlyModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            image = push_image(data["name"], data["tag"], data["files"])
+            image = push_image(data["name"], data["tag"], data["entries"])
         except MissingBlobs as error:
             return Response({"detail": str(error), "missing": error.digests}, status=status.HTTP_400_BAD_REQUEST)
         except InvalidImage as error:
-            raise ValidationError({"files": [str(error)]})
+            raise ValidationError({"entries": [str(error)]})
         return Response({"image": ImageSerializer(image).data}, status=status.HTTP_201_CREATED)
 
     @action(detail=True)
     def index(self, request, pk=None):
         image = self.get_object()
-        files = image.files.values_list("path", "blob_id", "blob__size")
-        return Response(
-            {
-                "image": ImageSerializer(image).data,
-                "files": [{"path": path, "digest": digest, "size": size} for path, digest, size in files],
-            }
-        )
+        rows = image.files.values_list("path", "kind", "mode", "mtime", "target", "blob_id", "blob__size")
+        entries = [
+            {"path": path, "kind": kind, "mode": mode, "mtime": mtime, "target": target, "digest": digest,
+             "size": size or 0}
+            for path, kind, mode, mtime, target, digest, size in rows
+        ]
+        return Response({"image": ImageSerializer(image).data, "entries": entries})
+
+    @action(detail=True)
+    def tar(self, request, pk=None):
+        image = self.get_object()
+        response = StreamingHttpResponse(export_tar(image), content_type="application/x-tar")
+        response["Content-Disposition"] = f'attachment; filename="{image.name.replace("/", "_")}-{image.tag}.tar"'
+        return response
 
 
 @api_view(["POST"])
@@ -71,7 +82,7 @@ def missing_blobs(request):
     return Response({"missing": [digest for digest in wanted if digest not in stored]})
 
 
-@csrf_exempt  # nothing here relies on a login cookie, and API clients don't send CSRF tokens
+@csrf_exempt
 @require_http_methods(["GET", "HEAD", "PUT"])
 def blob(request, digest):
     if not storage.DIGEST_RE.fullmatch(digest):

@@ -82,8 +82,9 @@ def stored_size(server, images):
     sizes = {}
     for image in images:
         with urlopen(f"{server}/api/images/{image['id']}/index/", timeout=30) as response:
-            for file in json.load(response)["files"]:
-                sizes[file["digest"]] = file["size"]
+            for entry in json.load(response)["entries"]:
+                if entry["kind"] == "file":
+                    sizes[entry["digest"]] = entry["size"]
     return sum(sizes.values())
 
 
