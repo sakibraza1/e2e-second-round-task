@@ -258,7 +258,6 @@ containerd as the root file system.
 ```text
 e2e-second-round-task/
 ├── README.md                  this file
-├── CLAUDE.md                  notes for AI coding assistants working in this repo
 ├── demo.sh                    the proof: starts real containers both ways and times them
 ├── demo.cast                  screencast of demo.sh (asciinema)
 ├── requirements.txt           Django, Django REST Framework, mfusepy
